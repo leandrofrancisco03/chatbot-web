@@ -49,6 +49,27 @@ function getOrCreateSession(): string {
   return id;
 }
 
+// ─── TTS Helper ───────────────────────────────────────────────────────────────
+/**
+ * Speaks the given text aloud using the native Web Speech API (speechSynthesis).
+ * Cancels any currently-playing speech before starting a new one so voices
+ * never overlap. No-ops on SSR or browsers without TTS support.
+ */
+function speakText(text: string): void {
+  if (typeof window === 'undefined') return;
+  if (!('speechSynthesis' in window)) return;
+
+  // Stop whatever is currently being spoken
+  window.speechSynthesis.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = 'es-ES';
+  utterance.rate = 1.0;
+  utterance.pitch = 1.0;
+
+  window.speechSynthesis.speak(utterance);
+}
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function Chatbot() {
   const [isOpen, setIsOpen] = useState(false);
@@ -162,6 +183,11 @@ export default function Chatbot() {
           timestamp: new Date(),
         };
         setMessages((prev) => [...prev, aiMsg]);
+
+        // ── TTS: speak the AI reply only when the user sent a voice message ──
+        if (payload.type === 'audio') {
+          speakText(data.ai_response_text);
+        }
 
         if (data.ai_audio_base64) playBase64Audio(data.ai_audio_base64);
       } catch (err) {
@@ -289,6 +315,11 @@ export default function Chatbot() {
       // ── Turn OFF voice mode ──────────────────────────────────────────────
       SpeechRecognition.stopListening();
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+
+      // Stop TTS immediately so the AI doesn't keep speaking in the background
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
 
       // Commit whatever was still in the buffer before stopping
       const pending = transcript.trim();
@@ -424,7 +455,13 @@ export default function Chatbot() {
             </p>
           </div>
           <button
-            onClick={() => setIsOpen(false)}
+            onClick={() => {
+              // Stop TTS when the user closes the chat window
+              if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+              }
+              setIsOpen(false);
+            }}
             aria-label="Minimizar chat"
             className="text-white/60 hover:text-white transition-colors shrink-0"
           >
