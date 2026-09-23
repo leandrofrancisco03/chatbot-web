@@ -15,9 +15,8 @@ import ChatMessageBubble, {
 import type { ChatMessage, WebhookPayload, WebhookResponse } from './types';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const WEBHOOK_URL =
-  process.env.NEXT_PUBLIC_WEBHOOK_URL ??
-  'https://tu-url-de-n8n.com/webhook/chat';
+// Apunta al Route Handler local — las credenciales de n8n viven SOLO en el servidor.
+const WEBHOOK_URL = '/api/chat';
 
 const SESSION_KEY = 'velka_chat_session';
 
