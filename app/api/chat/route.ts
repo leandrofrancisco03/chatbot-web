@@ -9,7 +9,7 @@ import { NextRequest, NextResponse } from 'next/server';
  */
 export async function POST(req: NextRequest) {
   const webhookUrl = process.env.N8N_WEBHOOK_URL;
-  const apiKey     = process.env.N8N_WEBHOOK_SECRET;
+  const apiKey = process.env.N8N_WEBHOOK_SECRET;
 
   if (!webhookUrl) {
     console.error('[/api/chat] N8N_WEBHOOK_URL no está definida.');

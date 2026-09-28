@@ -49,11 +49,64 @@ function getOrCreateSession(): string {
   return id;
 }
 
-// ─── TTS Helper ───────────────────────────────────────────────────────────────
+// ─── TTS Helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * Name of the preferred TTS voice. Change this constant to switch voices
+ * without touching the rest of the logic.
+ * Common values: 'Google español', 'Microsoft Sabina', 'Paulina'
+ */
+const PREFERRED_VOICE = 'Google español';
+
+/**
+ * Strips emojis and Markdown formatting characters so the TTS engine
+ * reads clean, natural prose instead of symbol names.
+ */
+function cleanTextForSpeech(text: string): string {
+  return text
+    // Remove emoji (covers Unicode emoji ranges + variation selectors + ZWJ sequences)
+    .replace(
+      /[\u{1F000}-\u{1FFFF}\u{2600}-\u{27FF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FEFF}\u{1F900}-\u{1F9FF}\u{E0000}-\u{E01FF}]/gu,
+      '',
+    )
+    // Remove Markdown bold / italic markers (* ** _ __)
+    .replace(/[*_]{1,3}/g, '')
+    // Remove Markdown headings (#, ##, ###…)
+    .replace(/^#{1,6}\s*/gm, '')
+    // Remove inline code backticks
+    .replace(/`+/g, '')
+    // Remove Markdown links — keep the label, drop the URL [label](url) → label
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    // Remove leftover square / angle brackets
+    .replace(/[[\]<>]/g, '')
+    // Collapse multiple spaces/newlines into a single space
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Resolves the best available Spanish TTS voice from the browser's list.
+ * Prefers PREFERRED_VOICE by name, then any voice whose lang starts with 'es'.
+ * Returns null when no suitable voice is found (browser will use its default).
+ */
+function pickSpanishVoice(): SpeechSynthesisVoice | null {
+  const voices = window.speechSynthesis.getVoices();
+  if (voices.length === 0) return null;
+
+  // 1st choice: exact preferred name match
+  const preferred = voices.find((v) => v.name === PREFERRED_VOICE);
+  if (preferred) return preferred;
+
+  // 2nd choice: any voice whose BCP-47 tag starts with 'es'
+  const anySpanish = voices.find((v) => v.lang.startsWith('es'));
+  return anySpanish ?? null;
+}
+
 /**
  * Speaks the given text aloud using the native Web Speech API (speechSynthesis).
  * Cancels any currently-playing speech before starting a new one so voices
- * never overlap. No-ops on SSR or browsers without TTS support.
+ * never overlap. Cleans the text of emojis and Markdown before speaking.
+ * No-ops on SSR or browsers without TTS support.
  */
 function speakText(text: string): void {
   if (typeof window === 'undefined') return;
@@ -62,12 +115,33 @@ function speakText(text: string): void {
   // Stop whatever is currently being spoken
   window.speechSynthesis.cancel();
 
-  const utterance = new SpeechSynthesisUtterance(text);
+  const clean = cleanTextForSpeech(text);
+  if (!clean) return; // nothing left after cleaning
+
+  const utterance = new SpeechSynthesisUtterance(clean);
   utterance.lang = 'es-ES';
   utterance.rate = 1.0;
   utterance.pitch = 1.0;
 
-  window.speechSynthesis.speak(utterance);
+  /**
+   * Chrome loads voices asynchronously — getVoices() returns [] on the first
+   * call until the 'voiceschanged' event fires. We try once immediately; if the
+   * list is empty we wait for that event and then speak.
+   */
+  const voice = pickSpanishVoice();
+  if (voice) {
+    utterance.voice = voice;
+    window.speechSynthesis.speak(utterance);
+  } else {
+    // Voices not loaded yet → wait for 'voiceschanged' (fires once in Chrome)
+    const onVoicesChanged = () => {
+      window.speechSynthesis.removeEventListener('voiceschanged', onVoicesChanged);
+      const resolvedVoice = pickSpanishVoice();
+      if (resolvedVoice) utterance.voice = resolvedVoice;
+      window.speechSynthesis.speak(utterance);
+    };
+    window.speechSynthesis.addEventListener('voiceschanged', onVoicesChanged);
+  }
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
