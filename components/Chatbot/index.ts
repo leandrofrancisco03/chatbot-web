@@ -3,4 +3,5 @@
  * Import like: import Chatbot from '@/components/Chatbot'
  */
 export { default } from './Chatbot';
-export type { ChatMessage, WebhookPayload, WebhookResponse } from './types';
+export type { DbMessage } from './Chatbot';
+export type { WebhookPayload, WebhookResponse } from './types';

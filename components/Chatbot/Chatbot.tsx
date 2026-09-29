@@ -4,6 +4,7 @@
 import 'regenerator-runtime/runtime';
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import useSWR from 'swr';
 import SpeechRecognition, {
   useSpeechRecognition,
 } from 'react-speech-recognition';
@@ -12,32 +13,32 @@ import ChatMessageBubble, {
   TypingIndicator,
   playBase64Audio,
 } from './ChatMessage';
-import type { ChatMessage, WebhookPayload, WebhookResponse } from './types';
+import type { WebhookPayload, WebhookResponse } from './types';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-// Apunta al Route Handler local — las credenciales de n8n viven SOLO en el servidor.
-const WEBHOOK_URL = '/api/chat';
-
+const CHAT_API_URL = '/api/chat';
 const SESSION_KEY = 'velka_chat_session';
-
-/**
- * How long (ms) of silence before we treat the user's speech as a complete
- * sentence and POST it to the webhook. 1800 ms feels natural — not too eager,
- * not too slow.
- */
 const SILENCE_DELAY_MS = 1800;
-
-/**
- * Minimum number of characters the transcript must have before we bother
- * sending. Avoids firing on "mm", "eh", stray clicks, etc.
- */
 const MIN_CHARS_TO_SEND = 5;
+/** SWR polling interval while chat is open (3 s) */
+const POLL_INTERVAL_MS = 3000;
+
+// ─── DB Message type (from Prisma) ───────────────────────────────────────────
+export interface DbMessage {
+  id: string;
+  sessionId: string;
+  role: 'user' | 'ai' | 'admin';
+  content: string;
+  type: string;
+  createdAt: string;
+}
+
+// ─── SWR fetcher ─────────────────────────────────────────────────────────────
+const fetcher = (url: string) => fetch(url).then((r) => r.json());
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function generateId(): string {
-  return crypto.randomUUID
-    ? crypto.randomUUID()
-    : Math.random().toString(36).slice(2);
+  return crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
 }
 
 function getOrCreateSession(): string {
@@ -50,90 +51,47 @@ function getOrCreateSession(): string {
 }
 
 // ─── TTS Helpers ──────────────────────────────────────────────────────────────
-
-/**
- * Name of the preferred TTS voice. Change this constant to switch voices
- * without touching the rest of the logic.
- * Common values: 'Google español', 'Microsoft Sabina', 'Paulina'
- */
 const PREFERRED_VOICE = 'Google español';
 
-/**
- * Strips emojis and Markdown formatting characters so the TTS engine
- * reads clean, natural prose instead of symbol names.
- */
 function cleanTextForSpeech(text: string): string {
   return text
-    // Remove emoji (covers Unicode emoji ranges + variation selectors + ZWJ sequences)
     .replace(
       /[\u{1F000}-\u{1FFFF}\u{2600}-\u{27FF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FEFF}\u{1F900}-\u{1F9FF}\u{E0000}-\u{E01FF}]/gu,
       '',
     )
-    // Remove Markdown bold / italic markers (* ** _ __)
     .replace(/[*_]{1,3}/g, '')
-    // Remove Markdown headings (#, ##, ###…)
     .replace(/^#{1,6}\s*/gm, '')
-    // Remove inline code backticks
     .replace(/`+/g, '')
-    // Remove Markdown links — keep the label, drop the URL [label](url) → label
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
-    // Remove leftover square / angle brackets
     .replace(/[[\]<>]/g, '')
-    // Collapse multiple spaces/newlines into a single space
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-/**
- * Resolves the best available Spanish TTS voice from the browser's list.
- * Prefers PREFERRED_VOICE by name, then any voice whose lang starts with 'es'.
- * Returns null when no suitable voice is found (browser will use its default).
- */
 function pickSpanishVoice(): SpeechSynthesisVoice | null {
   const voices = window.speechSynthesis.getVoices();
   if (voices.length === 0) return null;
-
-  // 1st choice: exact preferred name match
   const preferred = voices.find((v) => v.name === PREFERRED_VOICE);
   if (preferred) return preferred;
-
-  // 2nd choice: any voice whose BCP-47 tag starts with 'es'
   const anySpanish = voices.find((v) => v.lang.startsWith('es'));
   return anySpanish ?? null;
 }
 
-/**
- * Speaks the given text aloud using the native Web Speech API (speechSynthesis).
- * Cancels any currently-playing speech before starting a new one so voices
- * never overlap. Cleans the text of emojis and Markdown before speaking.
- * No-ops on SSR or browsers without TTS support.
- */
 function speakText(text: string): void {
   if (typeof window === 'undefined') return;
   if (!('speechSynthesis' in window)) return;
-
-  // Stop whatever is currently being spoken
   window.speechSynthesis.cancel();
-
   const clean = cleanTextForSpeech(text);
-  if (!clean) return; // nothing left after cleaning
-
+  if (!clean) return;
   const utterance = new SpeechSynthesisUtterance(clean);
   utterance.lang = 'es-ES';
   utterance.rate = 1.0;
   utterance.pitch = 1.0;
-
-  /**
-   * Chrome loads voices asynchronously — getVoices() returns [] on the first
-   * call until the 'voiceschanged' event fires. We try once immediately; if the
-   * list is empty we wait for that event and then speak.
-   */
   const voice = pickSpanishVoice();
   if (voice) {
     utterance.voice = voice;
     window.speechSynthesis.speak(utterance);
   } else {
-    // Voices not loaded yet → wait for 'voiceschanged' (fires once in Chrome)
     const onVoicesChanged = () => {
       window.speechSynthesis.removeEventListener('voiceschanged', onVoicesChanged);
       const resolvedVoice = pickSpanishVoice();
@@ -147,27 +105,32 @@ function speakText(text: string): void {
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function Chatbot() {
   const [isOpen, setIsOpen] = useState(false);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  /** True while continuous voice-mode is active */
   const [isVoiceMode, setIsVoiceMode] = useState(false);
   const [sessionId] = useState<string>(() => getOrCreateSession());
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  /** Holds the pending silence timer so we can cancel/reset it */
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /**
-   * We need isLoading inside the silence callback without causing stale closure.
-   * Keeping a ref in sync with the state solves this cleanly.
-   */
   const isLoadingRef = useRef(false);
+  /** Track the IDs of messages we've already read aloud to avoid re-speaking */
+  const spokenIdsRef = useRef<Set<string>>(new Set());
+
+  // ─── SWR: poll messages from DB ─────────────────────────────────────────────
+  const { data, mutate } = useSWR<{ messages: DbMessage[]; isHumanMode: boolean }>(
+    isOpen ? `/api/chat/messages?sessionId=${sessionId}` : null,
+    fetcher,
+    { refreshInterval: POLL_INTERVAL_MS, revalidateOnFocus: false },
+  );
+
+  const messages: DbMessage[] = data?.messages ?? [];
+  const isHumanMode: boolean = data?.isHumanMode ?? false;
 
   // ─── Speech Recognition hook ──────────────────────────────────────────────
   const {
-    transcript,          // confirmed (final) speech so far in this session
-    interimTranscript,   // words still being processed (not final yet)
+    transcript,
+    interimTranscript,
     listening,
     resetTranscript,
     browserSupportsSpeechRecognition,
@@ -184,26 +147,37 @@ export default function Chatbot() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isLoading, transcript, interimTranscript]);
 
-  // Focus text input when chat opens (only when not in voice mode)
+  // Focus text input when chat opens
   useEffect(() => {
     if (isOpen && !isVoiceMode) {
       setTimeout(() => inputRef.current?.focus(), 150);
     }
   }, [isOpen, isVoiceMode]);
 
-  // Clean up the silence timer when the component unmounts
+  // Cleanup silence timer on unmount
   useEffect(() => {
     return () => {
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     };
   }, []);
 
-  // ─── Send message to n8n webhook ──────────────────────────────────────────
+  // ── TTS: speak new AI messages when voice mode is active ──────────────────
+  useEffect(() => {
+    if (!isVoiceMode) return;
+    messages.forEach((msg) => {
+      if (msg.role === 'ai' && !spokenIdsRef.current.has(msg.id)) {
+        spokenIdsRef.current.add(msg.id);
+        speakText(msg.content);
+      }
+    });
+  }, [messages, isVoiceMode]);
+
+  // ─── Send message ─────────────────────────────────────────────────────────
   const sendToWebhook = useCallback(
-    async (payload: WebhookPayload, userMsgId: string) => {
+    async (payload: WebhookPayload) => {
       setIsLoading(true);
       try {
-        const res = await fetch(WEBHOOK_URL, {
+        const res = await fetch(CHAT_API_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -211,143 +185,61 @@ export default function Chatbot() {
 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-        // Normalize n8n response – may return an array ([{ output: "..." }]) or a plain object
         const bodyText = await res.text();
         if (!bodyText || bodyText.trim() === '') {
           throw new Error('El servidor devolvió una respuesta vacía.');
         }
-        const parsed = JSON.parse(bodyText);
-        // Unwrap array: n8n AI Agent node returns [{ output: "..." }]
-        const raw = Array.isArray(parsed) ? parsed[0] : parsed;
-        const responseText: string =
-          raw?.ai_response_text ??
-          raw?.output ??
-          raw?.message ??
-          raw?.text ??
-          'Sin respuesta del servidor.';
 
-        const data: WebhookResponse = {
-          type: raw.type ?? 'text',
-          ai_response_text: responseText,
-          user_transcription: raw.user_transcription,
-          ai_audio_base64: raw.ai_audio_base64,
-        };
+        const parsed: WebhookResponse & { isHumanMode?: boolean; output?: string } =
+          JSON.parse(bodyText);
 
-        // Mark the user bubble as sent (optionally update text if n8n corrected it)
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === userMsgId
-              ? {
-                ...m,
-                status: 'sent',
-                text: data.user_transcription ?? m.text,
-              }
-              : m,
-          ),
-        );
-
-        // Add AI response bubble
-        const aiMsg: ChatMessage = {
-          id: generateId(),
-          role: 'assistant',
-          text: data.ai_response_text,
-          type: data.type,
-          status: 'sent',
-          audioBase64: data.ai_audio_base64,
-          timestamp: new Date(),
-        };
-        setMessages((prev) => [...prev, aiMsg]);
-
-        // ── TTS: speak the AI reply only when the user sent a voice message ──
-        if (payload.type === 'audio') {
-          speakText(data.ai_response_text);
+        // If in human mode, just refresh messages (admin will reply)
+        if (parsed.isHumanMode) {
+          await mutate();
+          return;
         }
 
-        if (data.ai_audio_base64) playBase64Audio(data.ai_audio_base64);
+        // Play audio if present
+        if (parsed.ai_audio_base64) playBase64Audio(parsed.ai_audio_base64);
+
+        // Refresh SWR to show new messages from DB
+        await mutate();
       } catch (err) {
         console.error('Webhook error:', err);
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === userMsgId
-              ? { ...m, status: 'error', text: m.text + ' ⚠️' }
-              : m,
-          ),
-        );
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: generateId(),
-            role: 'assistant',
-            text: 'Lo siento, hubo un problema al conectar. Por favor intenta de nuevo.',
-            type: 'text',
-            status: 'sent',
-            timestamp: new Date(),
-          },
-        ]);
+        // Still refresh to show the user message that was saved
+        await mutate();
       } finally {
         setIsLoading(false);
       }
     },
-    [],
+    [mutate],
   );
 
-  // ─── Commit a transcript to the chat and fire the webhook ─────────────────
+  // ─── Commit transcript (voice mode) ──────────────────────────────────────
   const commitTranscript = useCallback(
     (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
-
-      const msgId = generateId();
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: msgId,
-          role: 'user',
-          text: trimmed,
-          type: 'audio',
-          status: 'sending',
-          timestamp: new Date(),
-        },
-      ]);
-
-      sendToWebhook({ sessionId, type: 'audio', content: trimmed }, msgId);
+      sendToWebhook({ sessionId, type: 'audio', content: trimmed });
     },
     [sessionId, sendToWebhook],
   );
 
   // ─── Silence detection ────────────────────────────────────────────────────
-  //
-  // Every time the FINAL transcript grows, we restart a countdown.
-  // If it doesn't grow again within SILENCE_DELAY_MS, the user has paused →
-  // we commit the message and reset the transcript so the next sentence starts
-  // fresh. The mic keeps listening the whole time.
-  //
   useEffect(() => {
-    if (!isVoiceMode) return;           // only active in voice mode
-    if (!transcript.trim()) return;     // nothing to send yet
-
-    // Cancel the previous countdown
+    if (!isVoiceMode) return;
+    if (!transcript.trim()) return;
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-
     silenceTimerRef.current = setTimeout(() => {
       const text = transcript.trim();
-
-      // Guard 1: minimum length
       if (text.length < MIN_CHARS_TO_SEND) {
         resetTranscript();
         return;
       }
-
-      // Guard 2: don't pile up requests — if we're still waiting for the last
-      // webhook response, skip this cycle (the transcript will keep growing
-      // if the user keeps talking, resetting the timer again).
       if (isLoadingRef.current) return;
-
-      // All good → commit and clear for the next sentence
       commitTranscript(text);
       resetTranscript();
     }, SILENCE_DELAY_MS);
-
     return () => {
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     };
@@ -355,47 +247,14 @@ export default function Chatbot() {
 
   // ─── Voice mode toggle ────────────────────────────────────────────────────
   const toggleVoiceMode = useCallback(() => {
-    if (!browserSupportsSpeechRecognition) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: generateId(),
-          role: 'assistant',
-          text: '⚠️ Tu navegador no soporta entrada de voz. Prueba con Google Chrome.',
-          type: 'text',
-          status: 'sent',
-          timestamp: new Date(),
-        },
-      ]);
-      return;
-    }
-
-    if (!isMicrophoneAvailable) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: generateId(),
-          role: 'assistant',
-          text: '🎤 No se pudo acceder al micrófono. Revisa los permisos del navegador.',
-          type: 'text',
-          status: 'sent',
-          timestamp: new Date(),
-        },
-      ]);
-      return;
-    }
-
+    if (!browserSupportsSpeechRecognition) return;
+    if (!isMicrophoneAvailable) return;
     if (isVoiceMode) {
-      // ── Turn OFF voice mode ──────────────────────────────────────────────
       SpeechRecognition.stopListening();
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-
-      // Stop TTS immediately so the AI doesn't keep speaking in the background
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
       }
-
-      // Commit whatever was still in the buffer before stopping
       const pending = transcript.trim();
       if (pending.length >= MIN_CHARS_TO_SEND && !isLoadingRef.current) {
         commitTranscript(pending);
@@ -403,14 +262,8 @@ export default function Chatbot() {
       resetTranscript();
       setIsVoiceMode(false);
     } else {
-      // ── Turn ON voice mode ───────────────────────────────────────────────
       resetTranscript();
-      SpeechRecognition.startListening({
-        continuous: true,
-        language: 'es-ES',
-        // interimResults: true is the default in react-speech-recognition;
-        // it gives us the live interimTranscript preview.
-      });
+      SpeechRecognition.startListening({ continuous: true, language: 'es-ES' });
       setIsVoiceMode(true);
     }
   }, [
@@ -428,28 +281,13 @@ export default function Chatbot() {
       e.preventDefault();
       const text = input.trim();
       if (!text || isLoading) return;
-
-      const msgId = generateId();
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: msgId,
-          role: 'user',
-          text,
-          type: 'text',
-          status: 'sending',
-          timestamp: new Date(),
-        },
-      ]);
       setInput('');
-      sendToWebhook({ sessionId, type: 'text', content: text }, msgId);
+      sendToWebhook({ sessionId, type: 'text', content: text });
     },
     [input, isLoading, sessionId, sendToWebhook],
   );
 
   // ─── Render ───────────────────────────────────────────────────────────────
-  // The live text to show in the preview bubble:
-  // final transcript (confirmed) + interimTranscript (being processed)
   const livePreview =
     (transcript + (interimTranscript ? ' ' + interimTranscript : '')).trim();
 
@@ -509,28 +347,25 @@ export default function Chatbot() {
             <svg className="w-5 h-5 text-white" viewBox="0 0 24 24" fill="currentColor">
               <path d="M12 2a5 5 0 1 1 0 10A5 5 0 0 1 12 2zm0 12c5.33 0 8 2.67 8 4v2H4v-2c0-1.33 2.67-4 8-4z" />
             </svg>
-            {/* Green "online" dot — turns into red pulse when listening */}
             <span
               className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-rose-600
-                ${isVoiceMode && listening
-                  ? 'bg-red-400 animate-pulse'
-                  : 'bg-emerald-400'
-                }`}
+                ${isVoiceMode && listening ? 'bg-red-400 animate-pulse' : isHumanMode ? 'bg-amber-400' : 'bg-emerald-400'}`}
             />
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-white font-semibold text-sm leading-none">Velka Spa IA</p>
+            <p className="text-white font-semibold text-sm leading-none">Velka Spa</p>
             <p className="text-white/70 text-xs mt-0.5 truncate">
               {isLoading
                 ? 'Procesando…'
-                : isVoiceMode && listening
-                  ? '🎤 Escuchando en tiempo real…'
-                  : 'En línea'}
+                : isHumanMode
+                  ? '👤 Atendido por recepción'
+                  : isVoiceMode && listening
+                    ? '🎤 Escuchando en tiempo real…'
+                    : 'En línea'}
             </p>
           </div>
           <button
             onClick={() => {
-              // Stop TTS when the user closes the chat window
               if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
                 window.speechSynthesis.cancel();
               }
@@ -559,7 +394,7 @@ export default function Chatbot() {
               </div>
               <p className="text-white font-semibold text-sm">¡Hola! Soy tu asistente de Velka Spa 💆‍♀️</p>
               <p className="text-white/50 text-xs leading-relaxed max-w-[220px]">
-                Escribe o activa el micrófono. En modo voz, te escucho continuamente y envío tu mensaje cuando detecte una pausa.
+                Escribe o activa el micrófono. En modo voz, te escucho continuamente.
               </p>
             </div>
           )}
@@ -568,22 +403,14 @@ export default function Chatbot() {
             <ChatMessageBubble key={msg.id} message={msg} />
           ))}
 
-          {/* ── Live transcript preview bubble ── */}
+          {/* Live transcript preview */}
           {isVoiceMode && livePreview && (
             <div className="flex flex-row-reverse items-end gap-2">
-              <div
-                className="
-                  max-w-[75%] rounded-2xl rounded-br-sm px-4 py-2.5 text-sm leading-relaxed
-                  bg-rose-500/20 border border-rose-400/40 text-white/80
-                "
-              >
-                {/* confirmed part */}
+              <div className="max-w-[75%] rounded-2xl rounded-br-sm px-4 py-2.5 text-sm leading-relaxed bg-rose-500/20 border border-rose-400/40 text-white/80">
                 <span>{transcript}</span>
-                {/* interim part — slightly dimmed */}
                 {interimTranscript && (
                   <span className="text-white/50"> {interimTranscript}</span>
                 )}
-                {/* blinking cursor */}
                 <span className="inline-block w-0.5 h-3.5 ml-1 bg-rose-400 rounded animate-pulse align-middle" />
               </div>
             </div>
@@ -604,12 +431,20 @@ export default function Chatbot() {
           <div ref={messagesEndRef} />
         </div>
 
+        {/* ── Human mode banner ── */}
+        {isHumanMode && (
+          <div className="flex items-center gap-2 px-4 py-2 bg-amber-500/20 border-t border-amber-500/30 text-xs text-amber-300">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+            Ahora te atiende un agente de recepción
+          </div>
+        )}
+
         {/* ── Input Area ── */}
         <form
           onSubmit={handleTextSubmit}
           className="flex items-center gap-2 px-3 py-3 bg-white/5 border-t border-white/10"
         >
-          {/* ── Mic / Voice-mode toggle button ── */}
+          {/* Mic button */}
           <button
             type="button"
             id="chatbot-mic-btn"
@@ -627,12 +462,10 @@ export default function Chatbot() {
             `}
           >
             {isVoiceMode ? (
-              /* Waveform / active icon */
               <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 3a1 1 0 0 0-1 1v16a1 1 0 0 0 2 0V4a1 1 0 0 0-1-1zm-4 3a1 1 0 0 0-1 1v10a1 1 0 0 0 2 0V7a1 1 0 0 0-1-1zm8 0a1 1 0 0 0-1 1v10a1 1 0 0 0 2 0V7a1 1 0 0 0-1-1zm-12 3a1 1 0 0 0-1 1v4a1 1 0 0 0 2 0v-4a1 1 0 0 0-1-1zm16 0a1 1 0 0 0-1 1v4a1 1 0 0 0 2 0v-4a1 1 0 0 0-1-1z" />
               </svg>
             ) : (
-              /* Mic icon */
               <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 14 0h-2z" />
               </svg>
@@ -657,7 +490,7 @@ export default function Chatbot() {
             "
           />
 
-          {/* Send button (text mode) */}
+          {/* Send button */}
           <button
             type="submit"
             id="chatbot-send-btn"
@@ -679,7 +512,7 @@ export default function Chatbot() {
           </button>
         </form>
 
-        {/* ── Voice-mode status strip ── */}
+        {/* Voice-mode status strip */}
         {isVoiceMode && (
           <div className="flex items-center justify-between px-4 py-1.5 bg-red-500/15 border-t border-red-500/25 text-xs text-red-300">
             <div className="flex items-center gap-2">
