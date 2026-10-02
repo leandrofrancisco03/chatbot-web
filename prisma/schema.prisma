@@ -13,6 +13,7 @@ datasource db {
 model ChatSession {
   id          String        @id @default(uuid())
   isHumanMode Boolean       @default(false)
+  isArchived  Boolean       @default(false)
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
   messages    ChatMessage[]

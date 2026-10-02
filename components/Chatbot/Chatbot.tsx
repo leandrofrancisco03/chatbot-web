@@ -4,6 +4,7 @@
 import 'regenerator-runtime/runtime';
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { usePathname } from 'next/navigation';
 import useSWR from 'swr';
 import SpeechRecognition, {
   useSpeechRecognition,
@@ -104,6 +105,7 @@ function speakText(text: string): void {
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function Chatbot() {
+  const pathname = usePathname();
   const [isOpen, setIsOpen] = useState(false);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -290,6 +292,9 @@ export default function Chatbot() {
   // ─── Render ───────────────────────────────────────────────────────────────
   const livePreview =
     (transcript + (interimTranscript ? ' ' + interimTranscript : '')).trim();
+
+  // Ocultar el widget flotante en el panel de administración
+  if (pathname?.startsWith('/recepcion-oculta')) return null;
 
   return (
     <>

@@ -8,6 +8,7 @@ import { prisma } from '@/lib/prisma';
 export async function GET() {
   try {
     const sessions = await prisma.chatSession.findMany({
+      where: { isArchived: false },
       orderBy: { updatedAt: 'desc' },
       include: {
         _count: { select: { messages: true } },

@@ -48,6 +48,22 @@ function formatRelativeTime(dateStr: string) {
   return `hace ${Math.floor(hrs / 24)}d`;
 }
 
+// ─── Activity semaphore ───────────────────────────────────────────────────────
+type ActivityStatus = 'online' | 'away' | 'inactive';
+
+function getActivityStatus(dateStr: string): ActivityStatus {
+  const mins = Math.floor((Date.now() - new Date(dateStr).getTime()) / 60000);
+  if (mins < 15) return 'online';
+  if (mins < 60) return 'away';
+  return 'inactive';
+}
+
+const ACTIVITY_CONFIG: Record<ActivityStatus, { dot: string; label: string; text: string }> = {
+  online:   { dot: 'bg-emerald-400',        label: 'En línea',  text: 'text-emerald-400' },
+  away:     { dot: 'bg-amber-400 animate-pulse', label: 'Ausente',   text: 'text-amber-400' },
+  inactive: { dot: 'bg-white/30',            label: 'Inactivo',  text: 'text-white/30'  },
+};
+
 // ─── Password Gate ────────────────────────────────────────────────────────────
 function PasswordGate({ onUnlock }: { onUnlock: () => void }) {
   const [value, setValue] = useState('');
@@ -241,6 +257,8 @@ export default function RecepcionOculta() {
   const [adminInput, setAdminInput] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [isToggling, setIsToggling] = useState(false);
+  const [isArchiving, setIsArchiving] = useState(false);
+  const [filter, setFilter] = useState<'activos' | 'todos'>('todos');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // ── Fetch sessions (poll every 4s) ───────────────────────────────────────
@@ -251,6 +269,11 @@ export default function RecepcionOculta() {
   );
 
   const sessions: Session[] = sessionsData?.sessions ?? [];
+
+  // ── Filter sessions by activity in frontend ──────────────────────────────
+  const filteredSessions = filter === 'activos'
+    ? sessions.filter((s) => getActivityStatus(s.updatedAt) !== 'inactive')
+    : sessions;
 
   // ── Fetch messages for selected session (poll every 2s) ──────────────────
   const { data: msgData, mutate: mutateMessages } = useSWR<{
@@ -314,6 +337,25 @@ export default function RecepcionOculta() {
     }
   }, [selectedSessionId, isHumanMode, isToggling, mutateMessages, mutateSessions]);
 
+  // ── Archive session (Inbox Zero) ─────────────────────────────────────────
+  const handleArchive = useCallback(async () => {
+    if (!selectedSessionId || isArchiving) return;
+    setIsArchiving(true);
+    try {
+      await fetch('/api/admin/archive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: selectedSessionId }),
+      });
+      setSelectedSessionId(null);
+      await mutateSessions();
+    } catch (err) {
+      console.error('[CRM] Error archivando sesión:', err);
+    } finally {
+      setIsArchiving(false);
+    }
+  }, [selectedSessionId, isArchiving, mutateSessions]);
+
   // ── Password gate ─────────────────────────────────────────────────────────
   if (!unlocked) {
     return <PasswordGate onUnlock={() => setUnlocked(true)} />;
@@ -343,25 +385,49 @@ export default function RecepcionOculta() {
           </div>
           <div className="mt-3 flex items-center gap-2 text-xs text-white/40">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            {sessions.length} sesiones activas
+            {filteredSessions.length} sesión{filteredSessions.length !== 1 ? 'es' : ''}
           </div>
+        </div>
+
+        {/* ── Filter Tabs ── */}
+        <div className="px-4 py-2.5 border-b border-white/10 flex gap-1">
+          {(['todos', 'activos'] as const).map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setFilter(tab)}
+              className={`
+                flex-1 py-1.5 rounded-lg text-[11px] font-semibold capitalize
+                transition-all duration-150
+                ${filter === tab
+                  ? 'bg-rose-500/20 text-rose-300 ring-1 ring-rose-500/40'
+                  : 'text-white/35 hover:text-white/60 hover:bg-white/5'
+                }
+              `}
+            >
+              {tab === 'todos' ? '📋 Todos' : '🟢 Activos (<60m)'}
+            </button>
+          ))}
         </div>
 
         {/* Session list */}
         <div className="flex-1 overflow-y-auto">
-          {sessions.length === 0 ? (
+          {filteredSessions.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-center p-8">
               <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center mb-3">
                 <svg className="w-6 h-6 text-white/20" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M20 2H4C2.9 2 2 2.9 2 4v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z" />
                 </svg>
               </div>
-              <p className="text-white/30 text-sm">Sin conversaciones aún</p>
+              <p className="text-white/30 text-sm">
+                {filter === 'activos' ? 'Sin sesiones activas' : 'Sin conversaciones aún'}
+              </p>
             </div>
           ) : (
-            sessions.map((session) => {
+            filteredSessions.map((session) => {
               const lastMsg = session.messages[0];
               const isSelected = session.id === selectedSessionId;
+              const status = getActivityStatus(session.updatedAt);
+              const { dot, label, text } = ACTIVITY_CONFIG[status];
 
               return (
                 <button
@@ -379,7 +445,12 @@ export default function RecepcionOculta() {
                       <div className="w-9 h-9 rounded-full bg-gradient-to-br from-slate-600 to-slate-700 flex items-center justify-center text-sm">
                         👤
                       </div>
-                      {/* Red dot = human mode active */}
+                      {/* Activity semaphore dot (bottom-left of avatar) */}
+                      <span
+                        title={label}
+                        className={`absolute -bottom-0.5 -left-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#110818] ${dot}`}
+                      />
+                      {/* Red dot = human mode active (top-right) */}
                       {session.isHumanMode && (
                         <span className="absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-rose-500 border-2 border-[#110818] animate-pulse" />
                       )}
@@ -391,9 +462,14 @@ export default function RecepcionOculta() {
                         <span className="text-xs font-mono text-white/70 font-semibold">
                           #{truncateId(session.id)}
                         </span>
-                        <span className="text-[10px] text-white/30 shrink-0">
-                          {formatRelativeTime(session.updatedAt)}
-                        </span>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className={`text-[9px] font-semibold uppercase tracking-wide ${text}`}>
+                            {label}
+                          </span>
+                          <span className="text-[10px] text-white/25">
+                            {formatRelativeTime(session.updatedAt)}
+                          </span>
+                        </div>
                       </div>
                       {lastMsg && (
                         <p className="text-xs text-white/40 truncate mt-0.5 leading-snug">
@@ -460,41 +536,70 @@ export default function RecepcionOculta() {
                 </div>
               </div>
 
-              {/* ── Toggle IA Button ── */}
-              <button
-                onClick={handleToggleIA}
-                disabled={isToggling}
-                className={`
-                  shrink-0 flex items-center gap-2.5 px-4 py-2.5 rounded-xl font-semibold text-sm
-                  transition-all duration-200 active:scale-95
-                  disabled:opacity-50 disabled:cursor-not-allowed
-                  ${isHumanMode
-                    ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-lg shadow-purple-500/25 hover:from-purple-500 hover:to-indigo-500'
-                    : 'bg-gradient-to-r from-rose-500 to-pink-600 text-white shadow-lg shadow-rose-500/25 hover:from-rose-400 hover:to-pink-500'
-                  }
-                `}
-              >
-                {isToggling ? (
-                  <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
-                    <path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" strokeOpacity={0.25} />
-                    <path d="M21 12a9 9 0 0 1-9 9" />
-                  </svg>
-                ) : isHumanMode ? (
-                  <>
-                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z" />
+              {/* ── Action Buttons ── */}
+              <div className="flex items-center gap-2 shrink-0">
+                {/* Toggle IA Button */}
+                <button
+                  onClick={handleToggleIA}
+                  disabled={isToggling}
+                  className={`
+                    flex items-center gap-2.5 px-4 py-2.5 rounded-xl font-semibold text-sm
+                    transition-all duration-200 active:scale-95
+                    disabled:opacity-50 disabled:cursor-not-allowed
+                    ${isHumanMode
+                      ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-lg shadow-purple-500/25 hover:from-purple-500 hover:to-indigo-500'
+                      : 'bg-gradient-to-r from-rose-500 to-pink-600 text-white shadow-lg shadow-rose-500/25 hover:from-rose-400 hover:to-pink-500'
+                    }
+                  `}
+                >
+                  {isToggling ? (
+                    <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                      <path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" strokeOpacity={0.25} />
+                      <path d="M21 12a9 9 0 0 1-9 9" />
                     </svg>
-                    Activar IA
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z" />
+                  ) : isHumanMode ? (
+                    <>
+                      <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z" />
+                      </svg>
+                      Activar IA
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z" />
+                      </svg>
+                      Tomar control
+                    </>
+                  )}
+                </button>
+
+                {/* Archive / Finalizar Chat Button */}
+                <button
+                  onClick={handleArchive}
+                  disabled={isArchiving}
+                  title="Archivar esta conversación (Inbox Zero)"
+                  className="
+                    flex items-center gap-2 px-3 py-2.5 rounded-xl font-semibold text-sm
+                    bg-white/5 border border-white/15 text-white/60
+                    hover:bg-emerald-500/15 hover:border-emerald-500/40 hover:text-emerald-300
+                    transition-all duration-200 active:scale-95
+                    disabled:opacity-50 disabled:cursor-not-allowed
+                  "
+                >
+                  {isArchiving ? (
+                    <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                      <path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" strokeOpacity={0.25} />
+                      <path d="M21 12a9 9 0 0 1-9 9" />
                     </svg>
-                    Tomar control
-                  </>
-                )}
-              </button>
+                  ) : (
+                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.16.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5L6.5 12H10v-2h4v2h3.5L12 17.5zM5.12 5l.81-1h12l.94 1H5.12z" />
+                    </svg>
+                  )}
+                  Archivar
+                </button>
+              </div>
             </header>
 
             {/* ── Mode banner ──────────────────────────────────────────────── */}
