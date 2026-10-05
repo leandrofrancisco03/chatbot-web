@@ -118,6 +118,8 @@ export default function Chatbot() {
   const isLoadingRef = useRef(false);
   /** Track the IDs of messages we've already read aloud to avoid re-speaking */
   const spokenIdsRef = useRef<Set<string>>(new Set());
+  /** True until the first SWR data arrives — used to silence historical messages */
+  const isInitialLoadRef = useRef(true);
 
   // ─── SWR: poll messages from DB ─────────────────────────────────────────────
   const { data, mutate } = useSWR<{ messages: DbMessage[]; isHumanMode: boolean }>(
@@ -165,13 +167,25 @@ export default function Chatbot() {
 
   // ── TTS: speak new AI messages when voice mode is active ──────────────────
   useEffect(() => {
+    if (messages.length === 0) return;
+
+    // First SWR load: silently mark all existing messages so they are never read
+    if (isInitialLoadRef.current) {
+      messages.forEach((msg) => spokenIdsRef.current.add(msg.id));
+      isInitialLoadRef.current = false;
+      return;
+    }
+
+    // Subsequent updates: only read the last message if it's new and from the AI
     if (!isVoiceMode) return;
-    messages.forEach((msg) => {
-      if (msg.role === 'ai' && !spokenIdsRef.current.has(msg.id)) {
-        spokenIdsRef.current.add(msg.id);
-        speakText(msg.content);
-      }
-    });
+    const last = messages[messages.length - 1];
+    if (
+      (last.role === 'ai' || last.role === 'admin') &&
+      !spokenIdsRef.current.has(last.id)
+    ) {
+      spokenIdsRef.current.add(last.id);
+      speakText(last.content);
+    }
   }, [messages, isVoiceMode]);
 
   // ─── Send message ─────────────────────────────────────────────────────────
